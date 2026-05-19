@@ -72,6 +72,20 @@ func main() {
 		cmdBuildColdEventsIndex()
 	case "events":
 		cmdEventsBench()
+	case "hot-ledger-concurrency-sweep":
+		cmdHotLedgerConcurrencySweep()
+	case "hot-tx-hash-concurrency-sweep":
+		cmdHotTxHashConcurrencySweep()
+	case "hot-events-concurrency-sweep":
+		cmdHotEventsConcurrencySweep()
+	case "hot-tx-page-concurrency-sweep":
+		cmdHotTxPageConcurrencySweep()
+	case "cold-tx-hash-concurrency-sweep":
+		cmdColdTxHashConcurrencySweep()
+	case "cold-tx-page-concurrency-sweep":
+		cmdColdTxPageConcurrencySweep()
+	case "cold-events-concurrency-sweep":
+		cmdColdEventsConcurrencySweep()
 	default:
 		fmt.Fprintln(os.Stderr, "unknown sub-command:", cmd)
 		usage()
@@ -90,6 +104,15 @@ sub-commands:
   ledger-range                   bench N-consecutive-ledger range
   ledger-range-concurrency-sweep grid (workers x page-size) cold-open range bench
   tx-page                        bench page of N transactions
+  tx-hash                        bench tx-by-hash end-to-end (txhash -> ledger -> scan)
+  events                         bench events (no-filter|contract|topic|both)
+  hot-ledger-concurrency-sweep   grid (workers x page-size) hot ledger RocksDB bench
+  hot-tx-hash-concurrency-sweep  worker sweep of tx-by-hash on hot stores
+  hot-events-concurrency-sweep   (scenario x workers) sweep on hot eventstore
+  hot-tx-page-concurrency-sweep  (workers x page-size) sweep on hot tx-page
+  cold-tx-hash-concurrency-sweep worker sweep of tx-by-hash on cold stores (evict+reopen per iter)
+  cold-tx-page-concurrency-sweep (workers x page-size) sweep of tx-page on shared cold reader
+  cold-events-concurrency-sweep  (scenario x workers) sweep on shared cold eventstore reader
 
 run "<sub-command> -h" for per-command flags`)
 }
