@@ -52,6 +52,8 @@ func main() {
 		cmdSeedTxHashHot()
 	case "seed-txhash-cold":
 		cmdSeedTxHashCold()
+	case "seed-txhash-cold-mphf":
+		cmdSeedTxHashColdMPHF()
 	case "ledger-point":
 		cmdLedgerPoint()
 	case "ledger-point-cold-open":
