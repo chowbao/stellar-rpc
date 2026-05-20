@@ -7,12 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"iter"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +19,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
 	goxdr "github.com/stellar/go-stellar-sdk/xdr"
 
@@ -53,19 +50,42 @@ func cmdIngestRawTxHash() {
 	chunk := fs.Int64("chunk", -1, "single chunk ID to extract; mutually exclusive with --all")
 	all := fs.Bool("all", false, "extract every chunk in --cold-dir")
 	workers := fs.Int("workers", runtime.NumCPU(), "parallel chunk-extraction goroutines")
-	xdrViews := fs.Bool("xdr-views", false,
-		"extract tx hashes via XDR views (zero-copy) instead of full LedgerCloseMeta decode")
+	xdrViews := fs.Bool("xdr-views", false, "extract tx hashes via XDR views (zero-copy slicing) instead of full LedgerCloseMeta decode")
 	cpuProfile := fs.String("cpuprofile", "", "write CPU profile to this path (overall run, not per-chunk)")
 	_ = fs.Parse(os.Args[1:])
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: create: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "cpuprofile: start: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	logger := supportlog.New()
 	logger.SetLevel(logrus.InfoLevel)
 
-	if stop := maybeStartCPUProfile(logger, *cpuProfile); stop != nil {
-		defer stop()
+	if *coldDir == "" {
+		fatal(logger, "--cold-dir is required")
 	}
-
-	validateIngestRawTxHashFlags(logger, *coldDir, *outDir, *chunk, *all, *workers)
+	if *outDir == "" {
+		fatal(logger, "--out-dir is required")
+	}
+	if !*all && *chunk < 0 {
+		fatal(logger, "either --chunk=N or --all is required")
+	}
+	if *all && *chunk >= 0 {
+		fatal(logger, "--chunk and --all are mutually exclusive")
+	}
+	if *workers < 1 {
+		fatal(logger, "--workers must be >= 1")
+	}
 
 	chunks, err := selectChunksForExtract(*coldDir, *chunk, *all)
 	if err != nil {
@@ -74,6 +94,7 @@ func cmdIngestRawTxHash() {
 	if len(chunks) == 0 {
 		fatal(logger, "no chunks found under %s", *coldDir)
 	}
+
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		fatal(logger, "mkdir %s: %v", *outDir, err)
 	}
@@ -81,84 +102,6 @@ func cmdIngestRawTxHash() {
 	logger.Infof("ingest-raw-txhash cold-dir=%s out-dir=%s chunks=%d workers=%d xdr-views=%v",
 		*coldDir, *outDir, len(chunks), *workers, *xdrViews)
 
-	start := time.Now()
-	perChunkDurs, totalEntries := runIngestWorkers(logger, *coldDir, *outDir, *workers, *xdrViews, chunks)
-	wall := time.Since(start)
-
-	stats := computeStats(perChunkDurs)
-	logger.Infof("extracted %d entries from %d chunks in %s wall (%.0f entries/s aggregate)",
-		totalEntries, len(chunks),
-		wall.Round(time.Millisecond),
-		float64(totalEntries)/wall.Seconds(),
-	)
-	logger.Infof("per-chunk: n=%d p50=%s p90=%s p99=%s max=%s mean=%s",
-		stats.n,
-		stats.p50.Round(time.Millisecond),
-		stats.p90.Round(time.Millisecond),
-		stats.p99.Round(time.Millisecond),
-		stats.maxv.Round(time.Millisecond),
-		(stats.total / time.Duration(stats.n)).Round(time.Millisecond),
-	)
-}
-
-// maybeStartCPUProfile opens cpuProfilePath and starts CPU profiling,
-// returning the teardown func the caller should defer. Returns nil if
-// no profile path was supplied.
-func maybeStartCPUProfile(logger *supportlog.Entry, cpuProfilePath string) func() {
-	if cpuProfilePath == "" {
-		return nil
-	}
-	f, err := os.Create(cpuProfilePath)
-	if err != nil {
-		fatal(logger, "cpuprofile: create %s: %v", cpuProfilePath, err)
-	}
-	if err := pprof.StartCPUProfile(f); err != nil {
-		_ = f.Close()
-		fatal(logger, "cpuprofile: start: %v", err)
-	}
-	return func() {
-		pprof.StopCPUProfile()
-		_ = f.Close()
-	}
-}
-
-// validateIngestRawTxHashFlags enforces the flag invariants. Calls
-// fatal on the first violation.
-func validateIngestRawTxHashFlags(
-	logger *supportlog.Entry,
-	coldDir, outDir string,
-	chunk int64, all bool, workers int,
-) {
-	if coldDir == "" {
-		fatal(logger, "--cold-dir is required")
-	}
-	if outDir == "" {
-		fatal(logger, "--out-dir is required")
-	}
-	if !all && chunk < 0 {
-		fatal(logger, "either --chunk=N or --all is required")
-	}
-	if all && chunk >= 0 {
-		fatal(logger, "--chunk and --all are mutually exclusive")
-	}
-	if workers < 1 {
-		fatal(logger, "--workers must be >= 1")
-	}
-	if chunk > math.MaxUint32 {
-		fatal(logger, "--chunk=%d exceeds uint32", chunk)
-	}
-}
-
-// runIngestWorkers spawns the worker pool, dispatches chunks via a
-// work channel, and returns per-chunk durations + total entries. On
-// the first worker error it fatals.
-func runIngestWorkers(
-	logger *supportlog.Entry,
-	coldDir, outDir string,
-	workers int,
-	xdrViews bool,
-	chunks []uint32,
-) ([]time.Duration, int64) {
 	work := make(chan uint32, len(chunks))
 	for _, c := range chunks {
 		work <- c
@@ -177,11 +120,14 @@ func runIngestWorkers(
 		errOnce      sync.Once
 		firstErr     error
 	)
-	for range workers {
-		wg.Go(func() {
+	start := time.Now()
+	for w := 0; w < *workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			for chunkID := range work {
 				t0 := time.Now()
-				n, perr := extractChunk(coldDir, outDir, chunkID, xdrViews)
+				n, perr := extractChunk(*coldDir, *outDir, chunkID, *xdrViews)
 				d := time.Since(t0)
 				if perr != nil {
 					errOnce.Do(func() { firstErr = fmt.Errorf("chunk %d: %w", chunkID, perr) })
@@ -190,13 +136,16 @@ func runIngestWorkers(
 				totalEntries.Add(int64(n))
 				results <- chunkResult{entries: n, elapsed: d}
 			}
-		})
+		}()
 	}
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
+	// Collect per-chunk timings as they complete so the final summary
+	// can report distribution stats (p50/p99/etc) in addition to the
+	// aggregate wall time.
 	perChunkDurs := make([]time.Duration, 0, len(chunks))
 	for r := range results {
 		perChunkDurs = append(perChunkDurs, r.elapsed)
@@ -204,17 +153,27 @@ func runIngestWorkers(
 	if firstErr != nil {
 		fatal(logger, "%v", firstErr)
 	}
-	return perChunkDurs, totalEntries.Load()
+
+	wall := time.Since(start)
+	stats := computeStats(perChunkDurs)
+	logger.Infof("extracted %d entries from %d chunks in %s wall (%.0f entries/s aggregate)",
+		totalEntries.Load(), len(chunks),
+		wall.Round(time.Millisecond),
+		float64(totalEntries.Load())/wall.Seconds(),
+	)
+	logger.Infof("per-chunk: n=%d p50=%s p90=%s p99=%s max=%s mean=%s",
+		stats.n,
+		stats.p50.Round(time.Millisecond),
+		stats.p90.Round(time.Millisecond),
+		stats.p99.Round(time.Millisecond),
+		stats.maxv.Round(time.Millisecond),
+		(stats.total / time.Duration(stats.n)).Round(time.Millisecond),
+	)
 }
 
-// selectChunksForExtract resolves the chunk IDs to process. single
-// is already bounds-checked by validateIngestRawTxHashFlags before
-// this is called (0 <= single <= MaxUint32).
+// selectChunksForExtract resolves the chunk IDs to process.
 func selectChunksForExtract(coldDir string, single int64, all bool) ([]uint32, error) {
 	if !all {
-		if single < 0 || single > math.MaxUint32 {
-			return nil, fmt.Errorf("chunk %d out of uint32 range", single)
-		}
 		return []uint32{uint32(single)}, nil
 	}
 	matches, err := filepath.Glob(filepath.Join(coldDir, "*", "*.pack"))
@@ -230,7 +189,7 @@ func selectChunksForExtract(coldDir string, single int64, all bool) ([]uint32, e
 		}
 		chunks = append(chunks, uint32(id))
 	}
-	slices.Sort(chunks)
+	sort.Slice(chunks, func(i, j int) bool { return chunks[i] < chunks[j] })
 	return chunks, nil
 }
 
@@ -339,7 +298,7 @@ func extractTxHashesFull(rawLCM []byte, seq uint32, emit func(seq uint32, hash [
 		return fmt.Errorf("unmarshal: %w", err)
 	}
 	nTx := lcm.CountTransactions()
-	for i := range nTx {
+	for i := 0; i < nTx; i++ {
 		h := lcm.TransactionHash(i)
 		emit(seq, h[:])
 	}
@@ -432,3 +391,4 @@ func emitHashesView[T txResultMeta](
 	}
 	return nil
 }
+

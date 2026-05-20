@@ -1,21 +1,24 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"iter"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/sirupsen/logrus"
-
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
 	goxdr "github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/fullhistory/pkg/stores/ledger"
 	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/fullhistory/pkg/stores/txhash"
+	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/fullhistory/pkg/txquery"
 )
 
 // cmdTxHash benches "transaction by hash" end-to-end: hash → seq lookup
@@ -37,6 +40,9 @@ func cmdTxHash() {
 	warmup := fs.Int("warmup", 100, "warm-up lookups")
 	seed := fs.Int64("seed", 1, "RNG seed")
 	outDir := fs.String("out", "bench-out", "CSV output dir")
+	xdrViews := fs.Bool("xdr-views", false,
+		"after the ledger fetch, find the tx by hash via XDR views (zero-copy slicing) "+
+			"instead of a full LedgerCloseMeta UnmarshalBinary. Ignored for --tier=cold-mphf-txquery.")
 	_ = fs.Parse(os.Args[1:])
 
 	logger := supportlog.New()
@@ -59,11 +65,11 @@ func cmdTxHash() {
 		fatal(logger, "empty corpus — run seed-txhash-cold first")
 	}
 
-	// Open the tier-specific readers.
 	var (
-		txhashGet func([32]byte) (uint32, error)
-		ledgerGet func(uint32) ([]byte, error)
-		closers   []func() error
+		txhashGet  func([32]byte) (uint32, error)
+		ledgerGet  func(uint32) ([]byte, error)
+		mphfLookup *txquery.ColdLookup
+		closers    []func() error
 	)
 
 	switch *tier {
@@ -104,23 +110,30 @@ func cmdTxHash() {
 		ledgerGet = cr.GetLedgerRaw
 
 	case "cold-mphf":
-		mph, oerr := txhash.OpenColdReader(*txColdMPHF)
+		mph, cr, closer, oerr := openColdMPHFAndPack(*coldDir, *txColdMPHF, chunkID)
 		if oerr != nil {
-			fatal(logger, "txhash.OpenColdReader: %v", oerr)
+			fatal(logger, "open cold-mphf readers: %v", oerr)
 		}
-		closers = append(closers, mph.Close)
+		closers = append(closers, closer)
 		txhashGet = mph.Lookup
-
-		path := packPath(*coldDir, chunkID)
-		cr, oerr := ledger.NewColdStoreReader(path)
-		if oerr != nil {
-			fatal(logger, "NewColdStoreReader: %v", oerr)
-		}
-		closers = append(closers, cr.Close)
 		ledgerGet = cr.GetLedgerRaw
 
+	case "cold-mphf-txquery":
+		// Routes through txquery.ColdLookup so the per-op result is a
+		// fully parsed db.Transaction — matching what production's
+		// methods.GetTransaction consumes from the hot DB path.
+		mph, cr, closer, oerr := openColdMPHFAndPack(*coldDir, *txColdMPHF, chunkID)
+		if oerr != nil {
+			fatal(logger, "open cold-mphf readers: %v", oerr)
+		}
+		closers = append(closers, closer)
+		mphfLookup = txquery.NewColdLookup(mph, cr, PubnetPassphrase)
+		if *xdrViews {
+			logger.Warn("--xdr-views has no effect with --tier=cold-mphf-txquery (decode happens inside txquery.ColdLookup)")
+		}
+
 	default:
-		fatal(logger, "unknown --tier=%q (want hot|cold|cold-mphf)", *tier)
+		fatal(logger, "unknown --tier=%q (want hot|cold|cold-mphf|cold-mphf-txquery)", *tier)
 	}
 	defer func() {
 		for _, c := range closers {
@@ -136,8 +149,20 @@ func cmdTxHash() {
 		return corpus[i].hash, corpus[i].seq
 	}
 
-	// One end-to-end lookup: hash → seq → ledger → find tx-by-hash.
+	ctx := context.Background()
+
 	doOne := func(hash [32]byte, expectedSeq uint32) error {
+		if mphfLookup != nil {
+			tx, gerr := mphfLookup.GetTransaction(ctx, goxdr.Hash(hash))
+			if gerr != nil {
+				return fmt.Errorf("ColdLookup.GetTransaction: %w", gerr)
+			}
+			if tx.Ledger.Sequence != expectedSeq {
+				return fmt.Errorf("seq mismatch: got %d, expected %d", tx.Ledger.Sequence, expectedSeq)
+			}
+			return nil
+		}
+
 		seq, gerr := txhashGet(hash)
 		if gerr != nil {
 			return fmt.Errorf("txhashGet: %w", gerr)
@@ -151,6 +176,16 @@ func cmdTxHash() {
 		raw, rerr := ledgerGet(seq)
 		if rerr != nil {
 			return fmt.Errorf("ledgerGet(%d): %w", seq, rerr)
+		}
+		if *xdrViews {
+			found, ferr := findTxByHashView(raw, hash)
+			if ferr != nil {
+				return fmt.Errorf("findTxByHashView: %w", ferr)
+			}
+			if !found {
+				return fmt.Errorf("hash not found in ledger %d", seq)
+			}
+			return nil
 		}
 		var lcm goxdr.LedgerCloseMeta
 		if uerr := lcm.UnmarshalBinary(raw); uerr != nil {
@@ -176,7 +211,8 @@ func cmdTxHash() {
 		}
 	}
 
-	logger.Infof("tx-hash tier=%s chunk=%d iters=%d corpus=%d", *tier, chunkID, *iters, len(corpus))
+	logger.Infof("tx-hash tier=%s chunk=%d iters=%d corpus=%d xdr-views=%v",
+		*tier, chunkID, *iters, len(corpus), *xdrViews)
 
 	durs := make([]time.Duration, 0, *iters)
 	for i := 0; i < *iters; i++ {
@@ -191,14 +227,99 @@ func cmdTxHash() {
 	}
 
 	stats := computeStats(durs)
-	fmt.Println(stats.line(fmt.Sprintf("tx-hash-%s", *tier)))
+	suffix := ""
+	if *xdrViews {
+		suffix = "-xdrviews"
+	}
+	fmt.Println(stats.line(fmt.Sprintf("tx-hash-%s%s", *tier, suffix)))
 
-	csv := filepath.Join(*outDir, fmt.Sprintf("tx-hash-%s.csv", *tier))
+	csv := filepath.Join(*outDir, fmt.Sprintf("tx-hash-%s%s.csv", *tier, suffix))
 	if err := writeCSV(csv, durs); err != nil {
 		logger.WithError(err).Warnf("could not write CSV %s", csv)
 	} else {
 		logger.Infof("wrote %s", csv)
 	}
+}
+
+// findTxByHashView walks rawLCM as an XDR view, locates the
+// transaction matching target by comparing TransactionResultPair
+// hashes, and returns true on match. No full UnmarshalBinary.
+//
+// txResultMeta (V0/V1 vs V2 result type) is defined in
+// bench_ingest_raw_txhash.go and reused via the package-level
+// scanForHashView generic below.
+func findTxByHashView(rawLCM []byte, target [32]byte) (bool, error) {
+	v := goxdr.LedgerCloseMetaView(rawLCM)
+	dv, err := v.V()
+	if err != nil {
+		return false, err
+	}
+	disc, err := dv.Value()
+	if err != nil {
+		return false, err
+	}
+	switch disc {
+	case 0:
+		v0, err := v.V0()
+		if err != nil {
+			return false, err
+		}
+		tp, err := v0.TxProcessing()
+		if err != nil {
+			return false, err
+		}
+		return scanForHashView(tp.Iter(), target)
+	case 1:
+		v1, err := v.V1()
+		if err != nil {
+			return false, err
+		}
+		tp, err := v1.TxProcessing()
+		if err != nil {
+			return false, err
+		}
+		return scanForHashView(tp.Iter(), target)
+	case 2:
+		v2, err := v.V2()
+		if err != nil {
+			return false, err
+		}
+		tp, err := v2.TxProcessing()
+		if err != nil {
+			return false, err
+		}
+		return scanForHashView(tp.Iter(), target)
+	default:
+		return false, fmt.Errorf("unknown LedgerCloseMeta V=%d", disc)
+	}
+}
+
+// scanForHashView iterates one LCM version's TxProcessing array via a
+// view and returns true on the first TransactionHash match against
+// target. The bytes underlying the matched hash alias rawLCM and are
+// only compared, never retained.
+func scanForHashView[T txResultMeta](src iter.Seq2[T, error], target [32]byte) (bool, error) {
+	for tx, iterErr := range src {
+		if iterErr != nil {
+			return false, iterErr
+		}
+		rp, err := tx.Result()
+		if err != nil {
+			return false, err
+		}
+		hv, err := rp.TransactionHash()
+		if err != nil {
+			return false, err
+		}
+		hb, err := hv.Value()
+		if err != nil {
+			return false, err
+		}
+		if len(hb) == 32 && bytes.Equal(hb, target[:]) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type corpusEntry struct {

@@ -312,17 +312,17 @@ func launchFinalMerge(streams []*streamReader) *streamReader {
 // --- Header scanning ---
 
 // scanHeaders concurrently reads the 8-byte LE header of each file
-// and returns the sum (total entry count across all files). Adapted
-// from streamhash cmd/bench/bench_files.go:scanHeaders — the only
-// deviations are wg.Go (Go 1.25) in place of manual Add/Done and a
-// comma-ok type assertion on the recorded error.
+// and returns the sum (total entry count across all files). Verbatim
+// port of streamhash cmd/bench/bench_files.go:scanHeaders.
 func scanHeaders(files []string) (uint64, error) {
 	var total atomic.Uint64
 	var firstErr atomic.Value
 
 	var wg sync.WaitGroup
 	for _, path := range files {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			f, err := os.Open(path)
 			if err != nil {
 				firstErr.CompareAndSwap(nil, err)
@@ -335,16 +335,12 @@ func scanHeaders(files []string) (uint64, error) {
 				return
 			}
 			total.Add(binary.LittleEndian.Uint64(header[:]))
-		})
+		}()
 	}
 	wg.Wait()
 
 	if v := firstErr.Load(); v != nil {
-		err, ok := v.(error)
-		if !ok {
-			return 0, fmt.Errorf("scanHeaders: unexpected error value %T", v)
-		}
-		return 0, err
+		return 0, v.(error)
 	}
 	return total.Load(), nil
 }

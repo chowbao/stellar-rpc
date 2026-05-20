@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
 	goxdr "github.com/stellar/go-stellar-sdk/xdr"
 

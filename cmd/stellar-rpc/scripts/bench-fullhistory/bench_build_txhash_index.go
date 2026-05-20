@@ -14,9 +14,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"github.com/tamirms/streamhash"
-
 	supportlog "github.com/stellar/go-stellar-sdk/support/log"
+	"github.com/tamirms/streamhash"
 
 	"github.com/stellar/stellar-rpc/cmd/stellar-rpc/internal/fullhistory/pkg/stores/txhash"
 )
@@ -47,9 +46,45 @@ func cmdBuildTxHashIndex() {
 	logger := supportlog.New()
 	logger.SetLevel(logrus.InfoLevel)
 
-	validateBuildTxHashFlags(logger, *inDir, *out, *workers, *mergers, *bufsize)
+	if *inDir == "" {
+		fatal(logger, "--in-dir is required")
+	}
+	if *out == "" {
+		fatal(logger, "--out is required")
+	}
+	if *workers < 1 {
+		fatal(logger, "--workers must be >= 1")
+	}
+	if *mergers < 1 {
+		fatal(logger, "--mergers must be >= 1")
+	}
+	if *bufsize < benchEntrySize {
+		fatal(logger, "--bufsize must be >= %d (entry size)", benchEntrySize)
+	}
 
-	files, minLedger, totalKeys := discoverBuildInputs(logger, *inDir)
+	files, err := filepath.Glob(filepath.Join(*inDir, "*.bin"))
+	if err != nil {
+		fatal(logger, "glob %s: %v", *inDir, err)
+	}
+	if len(files) == 0 {
+		fatal(logger, "no .bin files under %s", *inDir)
+	}
+	sort.Strings(files)
+
+	minChunkID, err := chunkIDFromBinFilename(filepath.Base(files[0]))
+	if err != nil {
+		fatal(logger, "derive min chunk: %v", err)
+	}
+	minLedger := chunkFirstLedger(minChunkID)
+
+	totalKeys, err := scanHeaders(files)
+	if err != nil {
+		fatal(logger, "scan headers: %v", err)
+	}
+	if totalKeys == 0 {
+		fatal(logger, "no entries across %d files; refusing to build empty index", len(files))
+	}
+
 	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
 		fatal(logger, "mkdir output dir: %v", err)
 	}
@@ -99,60 +134,6 @@ func cmdBuildTxHashIndex() {
 	)
 }
 
-// validateBuildTxHashFlags enforces the required-flag invariants for
-// cmdBuildTxHashIndex. Calls fatal on the first violation.
-func validateBuildTxHashFlags(
-	logger *supportlog.Entry,
-	inDir, out string,
-	workers, mergers, bufsize int,
-) {
-	if inDir == "" {
-		fatal(logger, "--in-dir is required")
-	}
-	if out == "" {
-		fatal(logger, "--out is required")
-	}
-	if workers < 1 {
-		fatal(logger, "--workers must be >= 1")
-	}
-	if mergers < 1 {
-		fatal(logger, "--mergers must be >= 1")
-	}
-	if bufsize < benchEntrySize {
-		fatal(logger, "--bufsize must be >= %d (entry size)", benchEntrySize)
-	}
-}
-
-// discoverBuildInputs globs the .bin files in inDir, derives the
-// minimum ledger from the lowest-numbered chunk filename, and sums
-// the file headers to compute the total key count. Calls fatal if
-// any step fails or yields zero work.
-func discoverBuildInputs(logger *supportlog.Entry, inDir string) ([]string, uint32, uint64) {
-	files, err := filepath.Glob(filepath.Join(inDir, "*.bin"))
-	if err != nil {
-		fatal(logger, "glob %s: %v", inDir, err)
-	}
-	if len(files) == 0 {
-		fatal(logger, "no .bin files under %s", inDir)
-	}
-	sort.Strings(files)
-
-	minChunkID, err := chunkIDFromBinFilename(filepath.Base(files[0]))
-	if err != nil {
-		fatal(logger, "derive min chunk: %v", err)
-	}
-	minLedger := chunkFirstLedger(minChunkID)
-
-	totalKeys, err := scanHeaders(files)
-	if err != nil {
-		fatal(logger, "scan headers: %v", err)
-	}
-	if totalKeys == 0 {
-		fatal(logger, "no entries across %d files; refusing to build empty index", len(files))
-	}
-	return files, minLedger, totalKeys
-}
-
 // feedSortedFromBinFiles assembles the merge tree from
 // streamhash_merge.go and feeds the sorted entry stream into the
 // SortedBuilder. The tree construction is a near-verbatim port of
@@ -167,7 +148,10 @@ func feedSortedFromBinFiles(
 	bufsize, numMergers int,
 	minLedger uint32,
 ) (uint64, error) {
-	G := max(numMergers, 1)
+	G := numMergers
+	if G < 1 {
+		G = 1
+	}
 	filesPerGroup := (len(files) + G - 1) / G
 	var streams []*streamReader
 	for i := 0; i < len(files); i += filesPerGroup {
@@ -206,15 +190,6 @@ func feedSortedFromBinFiles(
 				return keysAdded, fmt.Errorf("entry seq %d below minLedger %d", absSeq, minLedger)
 			}
 			payload := uint64(absSeq - minLedger)
-			// 24-bit ceiling matches txhash.ColdPayloadSize. Without this
-			// check streamhash would silently truncate the high byte and
-			// the index would return wrong seqs on lookup. Reader has the
-			// symmetric overflow check on read.
-			if payload > 0xFFFFFF {
-				return keysAdded, fmt.Errorf(
-					"payload offset %d exceeds %d-byte budget (absSeq=%d minLedger=%d)",
-					payload, txhash.ColdPayloadSize, absSeq, minLedger)
-			}
 			if err := builder.AddKey(entry[:keySize], payload); err != nil {
 				return keysAdded, fmt.Errorf("AddKey: %w", err)
 			}
@@ -235,3 +210,4 @@ func chunkIDFromBinFilename(name string) (uint32, error) {
 	}
 	return uint32(id), nil
 }
+
